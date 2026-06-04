@@ -15,6 +15,30 @@ app.use(cors({
 
 app.use(express.json())
 
+async function getStaffFromRequest(req) {
+  const authHeader = req.headers.authorization
+  if (!authHeader?.startsWith('Bearer ')) return null
+
+  const token = authHeader.split(' ')[1]
+  const { data: { user }, error } = await supabase.auth.getUser(token)
+  if (error || !user) return null
+
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('role, full_name')
+    .eq('id', user.id)
+    .single()
+
+  if (!profile || !['admin', 'reviewer'].includes(profile.role)) return null
+
+  return {
+    id: user.id,
+    email: user.email,
+    role: profile.role,
+    full_name: profile.full_name,
+  }
+}
+
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() })
@@ -24,13 +48,15 @@ app.get('/api/health', (req, res) => {
 app.get('/api/remedies', async (req, res) => {
   try {
     const { symptom } = req.query
+    const staff = await getStaffFromRequest(req)
     let query = supabase.from('remedies').select('*').order('created_at', { ascending: false })
+
+    if (!staff) {
+      query = query.eq('status', 'published')
+    }
 
     if (symptom) {
       query = query.contains('symptom_tags', [symptom])
-    } else {
-      // For admin, show all; for public, only published
-      // We'll improve this with auth later
     }
 
     const { data, error } = await query
@@ -45,11 +71,17 @@ app.get('/api/remedies', async (req, res) => {
 // GET single remedy
 app.get('/api/remedies/:id', async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const staff = await getStaffFromRequest(req)
+    let query = supabase
       .from('remedies')
       .select('*')
       .eq('id', req.params.id)
-      .single()
+
+    if (!staff) {
+      query = query.eq('status', 'published')
+    }
+
+    const { data, error } = await query.single()
 
     if (error) throw error
     if (!data) return res.status(404).json({ success: false, error: 'Not found' })
@@ -106,13 +138,29 @@ app.patch('/api/remedies/:id/status', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'Invalid status' });
     }
 
+    const { data: reviewerProfile } = await supabase
+      .from('profiles')
+      .select('full_name')
+      .eq('id', req.user.id)
+      .single()
+
+    const reviewerDisplayName =
+      reviewerProfile?.full_name || req.user.email || 'SafeMed Reviewer'
+
+    const updatePayload = {
+      status,
+      reviewer_id: req.user.id,
+      reviewer_name: reviewerDisplayName,
+      updated_at: new Date().toISOString(),
+    }
+
+    if (status === 'published') {
+      updatePayload.verified_at = new Date().toISOString()
+    }
+
     const { data, error } = await supabase
       .from('remedies')
-      .update({ 
-        status,
-        reviewer_name: req.user.email || 'Reviewer',
-        updated_at: new Date().toISOString()
-      })
+      .update(updatePayload)
       .eq('id', id)
       .select()
       .single();
