@@ -226,6 +226,66 @@ app.patch('/api/remedies/:id/status', authenticate, async (req, res) => {
   }
 });
 
+// Update remedy content for authors or admins
+app.patch('/api/remedies/:id', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const allowedFields = [
+      'title_en', 'title_ne', 'description_en', 'description_ne',
+      'ingredients_en', 'ingredients_ne', 'steps_en', 'steps_ne',
+      'precautions_en', 'precautions_ne', 'warnings_en', 'warnings_ne',
+      'symptom_tags', 'status'
+    ];
+
+    const updates = {};
+    for (const key of Object.keys(req.body)) {
+      if (allowedFields.includes(key)) {
+        updates[key] = req.body[key];
+      }
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ success: false, error: 'No valid fields to update' });
+    }
+
+    const { data: currentRemedy, error: fetchErr } = await supabase
+      .from('remedies')
+      .select('author_id, status')
+      .eq('id', id)
+      .single();
+
+    if (fetchErr) throw fetchErr;
+    if (!currentRemedy) {
+      return res.status(404).json({ success: false, error: 'Remedy not found' });
+    }
+
+    if (currentRemedy.status === 'published' && req.user.role !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Only admins can edit published remedies' });
+    }
+
+    const isAuthor = currentRemedy.author_id === req.user.id;
+    const isAdmin = req.user.role === 'admin';
+    if (!isAdmin && !isAuthor) {
+      return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+
+    updates.updated_at = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from('remedies')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // POST or update a review (reviewer action)
 app.post('/api/remedies/:id/reviews', authenticate, async (req, res) => {
   try {
@@ -265,13 +325,19 @@ app.get('/api/remedies/:id/reviews', authenticate, async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { data: counts, error: countsErr } = await supabase
+    const { data: reviewRows, error: reviewErr } = await supabase
       .from('remedy_reviews')
-      .select('decision, count:count(*)')
-      .eq('remedy_id', id)
-      .group('decision');
+      .select('decision')
+      .eq('remedy_id', id);
 
-    if (countsErr) throw countsErr;
+    if (reviewErr) throw reviewErr;
+
+    const countsObj = { approve: 0, needs_revision: 0, reject: 0 };
+    (reviewRows || []).forEach((row) => {
+      if (row?.decision && Object.prototype.hasOwnProperty.call(countsObj, row.decision)) {
+        countsObj[row.decision] += 1;
+      }
+    });
 
     const { data: recent, error: recentErr } = await supabase
       .from('remedy_reviews')
@@ -286,10 +352,13 @@ app.get('/api/remedies/:id/reviews', authenticate, async (req, res) => {
     const reviewerIds = (recent || []).map((r) => r.reviewer_id).filter(Boolean);
     let reviewerMap = {};
     if (reviewerIds.length > 0) {
-      const { data: profiles } = await supabase
+      const { data: profiles, error: profileErr } = await supabase
         .from('profiles')
         .select('id, full_name')
         .in('id', reviewerIds);
+
+      if (profileErr) throw profileErr;
+
       reviewerMap = (profiles || []).reduce((acc, p) => {
         acc[p.id] = p.full_name || null;
         return acc;
@@ -304,14 +373,8 @@ app.get('/api/remedies/:id/reviews', authenticate, async (req, res) => {
       updated_at: r.updated_at,
     }));
 
-    // normalize counts array into object { approve: n, needs_revision: n, reject: n }
-    const countsObj = { approve: 0, needs_revision: 0, reject: 0 };
-    (counts || []).forEach((c) => {
-      const key = c.decision;
-      countsObj[key] = parseInt(c.count, 10) || 0;
-    });
-
     res.json({ success: true, counts: countsObj, recent: recentWithNames });
+
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
