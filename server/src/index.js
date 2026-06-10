@@ -25,7 +25,7 @@ async function getStaffFromRequest(req) {
 
   const { data: profile } = await supabase
     .from('profiles')
-    .select('role, full_name')
+    .select('role, full_name, credentials')
     .eq('id', user.id)
     .single()
 
@@ -36,7 +36,34 @@ async function getStaffFromRequest(req) {
     email: user.email,
     role: profile.role,
     full_name: profile.full_name,
+    credentials: profile.credentials,
   }
+}
+
+async function enrichRemedies(remedies) {
+  const rows = remedies || []
+  const reviewerIds = [...new Set(rows.map((r) => r.reviewer_id).filter(Boolean))]
+
+  if (reviewerIds.length === 0) {
+    return rows.map((r) => ({ ...r, reviewer_credentials: null }))
+  }
+
+  const { data: profiles, error } = await supabase
+    .from('profiles')
+    .select('id, credentials')
+    .in('id', reviewerIds)
+
+  if (error) throw error
+
+  const credentialsById = (profiles || []).reduce((acc, profile) => {
+    acc[profile.id] = profile.credentials || null
+    return acc
+  }, {})
+
+  return rows.map((r) => ({
+    ...r,
+    reviewer_credentials: credentialsById[r.reviewer_id] || null,
+  }))
 }
 
 // Health check
@@ -51,21 +78,18 @@ app.get('/api/remedies', async (req, res) => {
     const staff = await getStaffFromRequest(req)
     // pagination
     const page = parseInt(req.query.page || '1', 10);
-    const limit = parseInt(req.query.limit || '10', 10);
+    const rawLimit = parseInt(req.query.limit || '10', 10);
+    const limit = Math.min(Math.max(rawLimit, 1), 50);
     const start = (Math.max(page, 1) - 1) * limit;
     const end = start + limit - 1;
 
     let query = supabase.from('remedies').select('*', { count: 'exact' }).order('created_at', { ascending: false })
+    query = query.eq('is_deleted', false)
 
     if (!staff) {
       query = query.eq('status', 'published')
     }
 
-    if (symptom) {
-      query = query.contains('symptom_tags', [symptom])
-    }
-
-    // apply symptom filter before range
     if (symptom) {
       query = query.contains('symptom_tags', [symptom])
     }
@@ -92,7 +116,8 @@ app.get('/api/remedies', async (req, res) => {
       });
     }
 
-    const enriched = (data || []).map((r) => ({ ...r, review_counts: reviewMap[r.id] || { approve: 0, needs_revision: 0, reject: 0 } }));
+    const withReviewerDetails = await enrichRemedies(data)
+    const enriched = withReviewerDetails.map((r) => ({ ...r, review_counts: reviewMap[r.id] || { approve: 0, needs_revision: 0, reject: 0 } }));
 
     res.json({ success: true, data: enriched, count: count || 0 })
   } catch (err) {
@@ -108,6 +133,7 @@ app.get('/api/remedies/:id', async (req, res) => {
       .from('remedies')
       .select('*')
       .eq('id', req.params.id)
+      .eq('is_deleted', false)
 
     if (!staff) {
       query = query.eq('status', 'published')
@@ -118,7 +144,8 @@ app.get('/api/remedies/:id', async (req, res) => {
     if (error) throw error
     if (!data) return res.status(404).json({ success: false, error: 'Not found' })
 
-    res.json({ success: true, data })
+    const [enriched] = await enrichRemedies([data])
+    res.json({ success: true, data: enriched })
   } catch (err) {
     res.status(500).json({ success: false, error: err.message })
   }
@@ -160,21 +187,58 @@ const authenticate = async (req, res, next) => {
   }
 };
 
+app.patch('/api/profile', authenticate, async (req, res) => {
+  try {
+    const updates = {};
+
+    if (typeof req.body.full_name !== 'undefined') {
+      updates.full_name = String(req.body.full_name).trim();
+    }
+
+    if (typeof req.body.credentials !== 'undefined') {
+      const credentials = String(req.body.credentials).trim();
+      updates.credentials = credentials || null;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ success: false, error: 'No valid profile fields to update' });
+    }
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .update(updates)
+      .eq('id', req.user.id)
+      .select('role, full_name, credentials')
+      .single();
+
+    if (error) throw error;
+
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Protected Admin Routes
 app.patch('/api/remedies/:id/status', authenticate, async (req, res) => {
   try {
     const { id } = req.params;
-    const { status } = req.body;
+    const { status, review_notes } = req.body;
 
     if (!['published', 'needs_revision', 'rejected'].includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
 
+    if (!['admin', 'reviewer'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: 'Only reviewers or admins can update remedy status' });
+    }
+
     // Fetch current remedy to enforce publish/change rules
     const { data: currentRemedy, error: fetchErr } = await supabase
       .from('remedies')
-      .select('status')
+      .select('status, warnings_en, warnings_ne')
       .eq('id', id)
+      .eq('is_deleted', false)
       .single();
 
     if (fetchErr) throw fetchErr;
@@ -182,6 +246,10 @@ app.patch('/api/remedies/:id/status', authenticate, async (req, res) => {
     // Prevent non-admin users from publishing
     if (status === 'published' && req.user.role !== 'admin') {
       return res.status(403).json({ success: false, error: 'Only admins can publish remedies' });
+    }
+
+    if (status === 'published' && !currentRemedy?.warnings_en && !currentRemedy?.warnings_ne) {
+      return res.status(400).json({ success: false, error: 'Warnings are required before publishing a remedy' });
     }
 
     // Prevent changes to already-published remedies by non-admins
@@ -207,7 +275,11 @@ app.patch('/api/remedies/:id/status', authenticate, async (req, res) => {
 
     if (status === 'published') {
       updatePayload.verified_at = new Date().toISOString()
-      updatePayload.verified_by_admin = req.user.id
+      updatePayload.review_notes = null
+    }
+
+    if (['needs_revision', 'rejected'].includes(status)) {
+      updatePayload.review_notes = typeof review_notes === 'string' ? review_notes.trim() || null : null
     }
 
     // Only reviewers/admins are allowed to update status via auth middleware.
@@ -234,7 +306,8 @@ app.patch('/api/remedies/:id', authenticate, async (req, res) => {
       'title_en', 'title_ne', 'description_en', 'description_ne',
       'ingredients_en', 'ingredients_ne', 'steps_en', 'steps_ne',
       'precautions_en', 'precautions_ne', 'warnings_en', 'warnings_ne',
-      'symptom_tags', 'status'
+      'symptom_tags', 'status', 'video_url', 'source_url', 'source_label',
+      'review_notes'
     ];
 
     const updates = {};
@@ -252,6 +325,7 @@ app.patch('/api/remedies/:id', authenticate, async (req, res) => {
       .from('remedies')
       .select('author_id, status')
       .eq('id', id)
+      .eq('is_deleted', false)
       .single();
 
     if (fetchErr) throw fetchErr;
@@ -353,21 +427,25 @@ app.get('/api/remedies/:id/reviews', authenticate, async (req, res) => {
     let reviewerMap = {};
     if (reviewerIds.length > 0) {
       const { data: profiles, error: profileErr } = await supabase
-        .from('profiles')
-        .select('id, full_name')
-        .in('id', reviewerIds);
+      .from('profiles')
+      .select('id, full_name, credentials')
+      .in('id', reviewerIds);
 
       if (profileErr) throw profileErr;
 
       reviewerMap = (profiles || []).reduce((acc, p) => {
-        acc[p.id] = p.full_name || null;
+        acc[p.id] = {
+          name: p.full_name || null,
+          credentials: p.credentials || null,
+        };
         return acc;
       }, {});
     }
 
     const recentWithNames = (recent || []).map((r) => ({
       reviewer_id: r.reviewer_id,
-      reviewer_name: reviewerMap[r.reviewer_id] || null,
+      reviewer_name: reviewerMap[r.reviewer_id]?.name || null,
+      reviewer_credentials: reviewerMap[r.reviewer_id]?.credentials || null,
       decision: r.decision,
       comment: r.comment,
       updated_at: r.updated_at,
@@ -390,6 +468,7 @@ app.delete('/api/remedies/:id', authenticate, async (req, res) => {
       .from('remedies')
       .select('*')
       .eq('id', id)
+      .eq('is_deleted', false)
       .single();
 
     if (fetchErr) throw fetchErr;
@@ -427,8 +506,9 @@ app.delete('/api/remedies/:id', authenticate, async (req, res) => {
 // CREATE new remedy (authenticated users)
 app.post('/api/remedies', authenticate, async (req, res) => {
   try {
-    const { title_en, title_ne, description_en, description_ne, ingredients_en, ingredients_ne,
-            steps_en, steps_ne, precautions_en, precautions_ne, warnings_en, warnings_ne, symptom_tags, status = 'draft' } = req.body;
+    if (!['admin', 'reviewer'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: 'Only reviewers or admins can create remedies' });
+    }
 
     // Build payload only from provided fields to avoid DB errors if optional
     // columns (like *_ne) are not present yet in the database.
@@ -436,7 +516,8 @@ app.post('/api/remedies', authenticate, async (req, res) => {
       'title_en','title_ne','description_en','description_ne',
       'ingredients_en','ingredients_ne','steps_en','steps_ne',
       'precautions_en','precautions_ne','warnings_en','warnings_ne',
-      'symptom_tags','status'
+      'symptom_tags','status','video_url','source_url','source_label',
+      'review_notes'
     ];
 
     const payload = {};
