@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { supabase } from '../config/supabase.js'
 import { authenticate, getStaffFromRequest } from '../middleware/auth.js'
+import { createNotification, notifyAdmins } from '../utils/notifications.js'
 
 const router = Router()
 
@@ -141,6 +142,18 @@ router.post('/', authenticate, async (req, res) => {
 
     if (error) throw error;
 
+    if (data) {
+      notifyAdmins({
+        remedyId: data.id,
+        titleEn: `New Remedy Draft Created`,
+        titleNe: `नयाँ रेमेडीको मस्यौदा सिर्जना भयो`,
+        messageEn: `A new remedy draft "${data.title_en}" has been created by ${req.user.email || 'staff'}.`,
+        messageNe: `स्टाफ ${req.user.email || ''} द्वारा नयाँ रेमेडी "${data.title_ne}" को मस्यौदा सिर्जना गरिएको छ।`,
+        type: 'new_remedy',
+        excludeUserId: req.user.id
+      }).catch((e) => console.error('notifyAdmins error:', e));
+    }
+
     res.json({ success: true, data });
   } catch (err) {
     console.error(err);
@@ -226,7 +239,7 @@ router.patch('/:id/status', authenticate, async (req, res) => {
 
     const { data: currentRemedy, error: fetchErr } = await supabase
       .from('remedies')
-      .select('status, warnings_en, warnings_ne')
+      .select('status, warnings_en, warnings_ne, author_id, title_en, title_ne')
       .eq('id', id)
       .eq('is_deleted', false)
       .single();
@@ -254,10 +267,40 @@ router.patch('/:id/status', authenticate, async (req, res) => {
     const reviewerDisplayName =
       reviewerProfile?.full_name || req.user.email || 'SafeMed Reviewer'
 
+    let finalReviewerId = req.user.id;
+    let finalReviewerName = reviewerDisplayName;
+
+    if (status === 'published') {
+      try {
+        // Find the latest approval by a reviewer (doctor)
+        const { data: approvals, error: appErr } = await supabase
+          .from('remedy_reviews')
+          .select('reviewer_id, profiles(full_name, role)')
+          .eq('remedy_id', id)
+          .eq('decision', 'approve');
+
+        if (!appErr && approvals && approvals.length > 0) {
+          // Find the latest approval where the user is a 'reviewer'
+          const doctorApproval = approvals.find(app => app.profiles?.role === 'reviewer');
+          if (doctorApproval) {
+            finalReviewerId = doctorApproval.reviewer_id;
+            finalReviewerName = doctorApproval.profiles?.full_name || 'SafeMed Reviewer';
+          } else {
+            // Fall back to the latest approval if no reviewer-role approval exists
+            const anyApproval = approvals[0];
+            finalReviewerId = anyApproval.reviewer_id;
+            finalReviewerName = anyApproval.profiles?.full_name || 'SafeMed Reviewer';
+          }
+        }
+      } catch (e) {
+        console.error('Error fetching doctor approval details:', e.message);
+      }
+    }
+
     const updatePayload = {
       status,
-      reviewer_id: req.user.id,
-      reviewer_name: reviewerDisplayName,
+      reviewer_id: finalReviewerId,
+      reviewer_name: finalReviewerName,
       updated_at: new Date().toISOString(),
     }
 
@@ -278,6 +321,66 @@ router.patch('/:id/status', authenticate, async (req, res) => {
       .single();
 
     if (error) throw error;
+
+    // Map status update to a reviewer decision so it is recorded in remedy_reviews history
+    let reviewDecision = null;
+    if (status === 'published') reviewDecision = 'approve';
+    else if (status === 'needs_revision') reviewDecision = 'needs_revision';
+    else if (status === 'rejected') reviewDecision = 'reject';
+
+    if (reviewDecision) {
+      try {
+        const { error: revErr } = await supabase
+          .from('remedy_reviews')
+          .upsert({
+            remedy_id: id,
+            reviewer_id: req.user.id,
+            decision: reviewDecision,
+            comment: review_notes ? String(review_notes).trim() : null,
+            updated_at: new Date().toISOString()
+          }, { onConflict: 'remedy_id, reviewer_id' });
+
+        if (revErr) {
+          console.error('Failed to log admin decision in remedy_reviews:', revErr.message);
+        }
+      } catch (revEx) {
+        console.error('Failed to log admin decision in remedy_reviews exception:', revEx.message);
+      }
+    }
+
+    if (currentRemedy && currentRemedy.author_id && currentRemedy.status !== status) {
+      let titleEn = `Remedy Status Updated`
+      let titleNe = `रेमेडीको स्थिति अपडेट भयो`
+      let msgEn = `Your remedy "${currentRemedy.title_en}" has been updated to "${status}".`
+      let msgNe = `तपाईंको रेमेडी "${currentRemedy.title_ne}" को स्थिति "${status}" मा अपडेट गरिएको छ।`
+
+      if (status === 'published') {
+        titleEn = `Remedy Published! 🌿`
+        titleNe = `रेमेडी प्रकाशित भयो! 🌿`
+        msgEn = `Congratulations! Your remedy "${currentRemedy.title_en}" has been verified and published.`
+        msgNe = `बधाई छ! तपाईंको रेमेडी "${currentRemedy.title_ne}" प्रमाणित र प्रकाशित भएको छ।`
+      } else if (status === 'needs_revision') {
+        titleEn = `Revision Required ⚠️`
+        titleNe = `संसोधन आवश्यक छ ⚠️`
+        msgEn = `Your remedy "${currentRemedy.title_en}" requires revisions. Notes: ${review_notes || 'No comments left.'}`
+        msgNe = `तपाईंको रेमेडी "${currentRemedy.title_ne}" संसोधन गर्न आवश्यक छ। टिप्पणी: ${review_notes || 'कुनै टिप्पणी छैन।'}`
+      } else if (status === 'rejected') {
+        titleEn = `Remedy Rejected ❌`
+        titleNe = `रेमेडी अस्वीकृत भयो ❌`
+        msgEn = `Your remedy "${currentRemedy.title_en}" was rejected during medical review.`
+        msgNe = `तपाईंको रेमेडी "${currentRemedy.title_ne}" चिकित्सा समीक्षाको क्रममा अस्वीकृत भयो।`
+      }
+
+      createNotification({
+        userId: currentRemedy.author_id,
+        remedyId: id,
+        titleEn,
+        titleNe,
+        messageEn: msgEn,
+        messageNe: msgNe,
+        type: 'status_change'
+      }).catch((e) => console.error('createNotification status change error:', e))
+    }
 
     res.json({ success: true, data });
   } catch (err) {
@@ -305,12 +408,50 @@ router.post('/:id/reviews', authenticate, async (req, res) => {
       return res.status(403).json({ success: false, error: 'Forbidden' });
     }
 
+    const { data: currentRemedy } = await supabase
+      .from('remedies')
+      .select('title_en, title_ne, author_id')
+      .eq('id', id)
+      .single();
+
     const { data, error } = await supabase
       .from('remedy_reviews')
       .upsert({ remedy_id: id, reviewer_id: req.user.id, decision, comment, updated_at: new Date().toISOString() }, { onConflict: 'remedy_id, reviewer_id' })
       .select();
 
     if (error) throw error;
+
+    if (currentRemedy) {
+      const { data: reviewerProfile } = await supabase
+        .from('profiles')
+        .select('full_name')
+        .eq('id', req.user.id)
+        .single();
+      const doctorName = reviewerProfile?.full_name || req.user.email || 'A medical professional';
+
+      if (currentRemedy.author_id && currentRemedy.author_id !== req.user.id) {
+        createNotification({
+          userId: currentRemedy.author_id,
+          remedyId: id,
+          titleEn: `New Review Submitted`,
+          titleNe: `नयाँ समीक्षा पेस गरियो`,
+          messageEn: `${doctorName} submitted a review (${decision}) for your remedy "${currentRemedy.title_en}".`,
+          messageNe: `${doctorName} ले तपाईंको रेमेडी "${currentRemedy.title_ne}" को लागि समीक्षा (${decision}) पेस गर्नुभयो।`,
+          type: 'new_review'
+        }).catch((e) => console.error('createNotification review error:', e));
+      }
+
+      notifyAdmins({
+        remedyId: id,
+        titleEn: `New Review on "${currentRemedy.title_en}"`,
+        titleNe: `"${currentRemedy.title_ne}" मा नयाँ समीक्षा`,
+        messageEn: `${doctorName} voted "${decision}" on remedy "${currentRemedy.title_en}".`,
+        messageNe: `${doctorName} ले रेमेडी "${currentRemedy.title_ne}" मा "${decision}" मतदान गर्नुभएको छ।`,
+        type: 'new_review',
+        excludeUserId: req.user.id
+      }).catch((e) => console.error('notifyAdmins review error:', e));
+    }
+
     res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });

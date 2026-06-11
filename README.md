@@ -124,6 +124,24 @@ All state-modifying requests require JWT authorization.
 
 ---
 
+### 5. Notifications Router (`/api/notifications`)
+
+| Method | Endpoint | Description | Auth Required |
+|:---|:---|:---|:---|
+| **GET** | `/api/notifications` | Fetch the current user's last 50 notifications. | Yes |
+| **PATCH** | `/api/notifications/:id` | Toggle status (`read` or `unread`) of a single notification. | Yes |
+| **POST** | `/api/notifications/mark-all-read` | Mark all unread notifications as read. | Yes |
+
+#### Payload Examples:
+* **PATCH `/api/notifications/:id`**:
+  ```json
+  {
+    "status": "read"
+  }
+  ```
+
+---
+
 ## 📧 Email Notification Service (SMTP)
 
 * **Mode 1: Mock/Simulation (Default)**:

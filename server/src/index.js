@@ -4,6 +4,7 @@ import dotenv from 'dotenv'
 import remediesRouter from './routes/remedies.js'
 import profileRouter from './routes/profile.js'
 import contactRouter from './routes/contact.js'
+import notificationsRouter from './routes/notifications.js'
 
 dotenv.config()
 
@@ -26,6 +27,7 @@ app.get('/api/health', (req, res) => {
 app.use('/api/remedies', remediesRouter)
 app.use('/api/profile', profileRouter)
 app.use('/api/contact', contactRouter)
+app.use('/api/notifications', notificationsRouter)
 
 app.listen(PORT, () => {
   console.log(`🚀 Backend running on http://localhost:${PORT}`)
