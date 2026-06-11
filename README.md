@@ -148,3 +148,140 @@ All state-modifying requests require JWT authorization.
   If `SMTP_USER` and `SMTP_PASS` are absent, the server automatically boots in developer preview mode. Submitted applications will output a temporary mail preview link in the console (e.g. via `Ethereal Email`) so you can inspect the email body in your browser without entering credentials.
 * **Mode 2: Live Mail Delivery**:
   When SMTP credentials are set, Nodemailer connects to Gmail and immediately dispatches professional, HTML-formatted reviewer applications to the address specified in `CONTACT_EMAIL`.
+
+---
+
+## 🗄️ Supabase Database Architecture & Schema
+
+The PostgreSQL database runs inside Supabase with Row-Level Security (RLS) active on all tables. 
+
+```mermaid
+erDiagram
+    PROFILES ||--o{ REMEDIES : "author_id / reviewer_id"
+    PROFILES ||--o{ REMEDY-REVIEWS : "reviewer_id"
+    PROFILES ||--o{ NOTIFICATIONS : "user_id"
+    REMEDIES ||--o{ REMEDY-REVIEWS : "remedy_id"
+    REMEDIES ||--o{ NOTIFICATIONS : "remedy_id"
+```
+
+### 1. Profiles Table (`public.profiles`)
+Links directly with Supabase's internal `auth.users` table. When a user registers, a Postgres trigger automatically generates a profile row with role `'user'`.
+
+| Column | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `UUID` | `PRIMARY KEY`, `REFERENCES auth.users(id)` | Matches the Auth User ID |
+| `email` | `TEXT` | `NOT NULL` | User's email address |
+| `full_name` | `TEXT` | - | Display name |
+| `role` | `TEXT` | `DEFAULT 'user'`, `CHECK (role IN ('admin','reviewer','user'))` | Access permissions level |
+| `credentials` | `TEXT` | - | Academic titles (e.g. MBBS, MD) |
+| `avatar_url` | `TEXT` | - | Link to profile picture |
+| `created_at` | `TIMESTAMPTZ`| `DEFAULT now()` | Creation date |
+
+* **RLS Policies**:
+  * Users can read all profiles (`role` checks, etc.).
+  * Users can update only their own profile details (`auth.uid() = id`).
+
+---
+
+### 2. Remedies Table (`public.remedies`)
+Stores all remedy specifications, instructions, warnings, and states.
+
+| Column | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `UUID` | `PRIMARY KEY`, `DEFAULT gen_random_uuid()` | Remedy unique ID |
+| `title_en` | `TEXT` | `NOT NULL` | Title in English |
+| `title_ne` | `TEXT` | - | Title in Nepali |
+| `description_en`| `TEXT` | `NOT NULL` | English description |
+| `description_ne`| `TEXT` | - | Nepali description |
+| `ingredients_en`| `TEXT[]` | - | English ingredients list array |
+| `ingredients_ne`| `TEXT[]` | - | Nepali ingredients list array |
+| `steps_en` | `TEXT[]` | `NOT NULL` | English step-by-step array |
+| `steps_ne` | `TEXT[]` | - | Nepali step-by-step array |
+| `precautions_en`| `TEXT[]` | - | English precautions array |
+| `precautions_ne`| `TEXT[]` | - | Nepali precautions array |
+| `warnings_en` | `TEXT` | - | English doctor-visit warnings |
+| `warnings_ne` | `TEXT` | - | Nepali doctor-visit warnings |
+| `symptom_tags` | `TEXT[]` | - | Symptoms search indexing array |
+| `video_url` | `TEXT` | - | Optional video guide link |
+| `source_url` | `TEXT` | - | Reference documentation URL |
+| `source_label` | `TEXT` | - | Descriptive source text label |
+| `status` | `TEXT` | `DEFAULT 'draft'`, `CHECK (status IN ('draft','pending','needs_revision','rejected','published'))` | Verification state |
+| `author_id` | `UUID` | `REFERENCES profiles(id)` | Author user profile link |
+| `reviewer_id` | `UUID` | `REFERENCES profiles(id)` | Verifying doctor profile link |
+| `reviewer_name`| `TEXT` | - | Cached reviewer full name |
+| `review_notes` | `TEXT` | - | Direct comments for revisions |
+| `is_deleted` | `BOOLEAN` | `DEFAULT false` | Soft delete marker |
+| `deleted_by` | `UUID` | `REFERENCES profiles(id)` | Soft delete operator |
+| `deleted_at` | `TIMESTAMPTZ`| - | Date of deletion |
+| `verified_at` | `TIMESTAMPTZ`| - | Date of verification publish |
+| `created_at` | `TIMESTAMPTZ`| `DEFAULT now()` | Creation timestamp |
+| `updated_at` | `TIMESTAMPTZ`| `DEFAULT now()` | Update timestamp |
+
+* **RLS Policies**:
+  * Anyone can select published, non-deleted remedies.
+  * Owners (`author_id = auth.uid()`) and reviewers/admins can select drafts.
+  * Reviewers and Admins can update status, while owners can only update their own drafts.
+
+---
+
+### 3. Remedy Reviews Table (`public.remedy_reviews`)
+Logs clinical review votes and comments from doctors on specific remedies.
+
+| Column | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `UUID` | `PRIMARY KEY`, `DEFAULT gen_random_uuid()` | Review log unique ID |
+| `remedy_id` | `UUID` | `NOT NULL`, `REFERENCES remedies(id) ON DELETE CASCADE` | Link to the remedy |
+| `reviewer_id` | `UUID` | `NOT NULL`, `REFERENCES profiles(id) ON DELETE CASCADE` | Link to the doctor |
+| `decision` | `TEXT` | `NOT NULL`, `CHECK (decision IN ('approve','needs_revision','reject'))` | Medical vote |
+| `comment` | `TEXT` | - | Review feedback comments |
+| `created_at` | `TIMESTAMPTZ`| `DEFAULT now()` | Date created |
+| `updated_at` | `TIMESTAMPTZ`| `DEFAULT now()` | Date updated |
+| **Index** | `UNIQUE` | `(remedy_id, reviewer_id)` | One review per doctor per remedy |
+
+* **RLS Policies**:
+  * Authenticated users can view reviews.
+  * Reviewers can insert/update/delete their own reviews, and Admins can manage all.
+
+---
+
+### 4. Reviewer Onboarding Applications Table (`public.reviewer_applications`)
+Stores submission forms from external doctors seeking to join the SafeMed platform.
+
+| Column | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `UUID` | `PRIMARY KEY`, `DEFAULT gen_random_uuid()` | Application unique ID |
+| `name` | `TEXT` | `NOT NULL` | Applicant name |
+| `email` | `TEXT` | `NOT NULL` | Applicant contact email |
+| `organization` | `TEXT` | - | Hospital or Clinic affiliation |
+| `credentials` | `TEXT` | `NOT NULL` | Qualifications (e.g. MBBS) |
+| `nmc_number` | `TEXT` | - | Nepal Medical Council registration No. |
+| `credential_link`| `TEXT` | `NOT NULL` | Mandatory link to folder/documents |
+| `message` | `TEXT` | `NOT NULL` | Motivation message |
+| `status` | `TEXT` | `DEFAULT 'pending'`, `CHECK (status IN ('pending','approved','rejected'))` | Request state |
+| `created_at` | `TIMESTAMPTZ`| `DEFAULT now()` | Application timestamp |
+
+* **RLS Policies**:
+  * Anyone can submit an application (INSERT).
+  * Only admins can select/view reviewer applications.
+
+---
+
+### 5. In-App Notifications Table (`public.notifications`)
+Feeds real-time system alerts to authenticated staff.
+
+| Column | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `UUID` | `PRIMARY KEY`, `DEFAULT gen_random_uuid()` | Notification unique ID |
+| `user_id` | `UUID` | `NOT NULL`, `REFERENCES profiles(id) ON DELETE CASCADE` | Link to recipient |
+| `remedy_id` | `UUID` | `REFERENCES remedies(id) ON DELETE SET NULL` | Reference remedy |
+| `title_en` | `TEXT` | `NOT NULL` | English alert title |
+| `title_ne` | `TEXT` | `NOT NULL` | Nepali alert title |
+| `message_en` | `TEXT` | `NOT NULL` | English description |
+| `message_ne` | `TEXT` | `NOT NULL` | Nepali description |
+| `type` | `TEXT` | `NOT NULL`, `CHECK (type IN ('status_change','new_review','new_remedy'))` | Trigger category |
+| `status` | `TEXT` | `DEFAULT 'unread'`, `CHECK (status IN ('unread','read'))` | Read tracking state |
+| `created_at` | `TIMESTAMPTZ`| `DEFAULT now()` | Timestamp |
+
+* **RLS Policies**:
+  * Users can only select (`SELECT`) and update (`UPDATE` - mark as read) their own notifications (`auth.uid() = user_id`).
+
