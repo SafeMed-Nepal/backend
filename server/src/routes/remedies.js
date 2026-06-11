@@ -84,6 +84,103 @@ router.get('/', async (req, res) => {
   }
 })
 
+// GET remedies stats (Admin/Reviewer only)
+router.get('/stats', authenticate, async (req, res) => {
+  try {
+    if (!['admin', 'reviewer'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+
+    // 1. Get status counts
+    const { data: statusRows, error: statusErr } = await supabase
+      .from('remedies')
+      .select('status')
+      .eq('is_deleted', false);
+
+    if (statusErr) throw statusErr;
+
+    const totalRemedies = statusRows.length;
+    const statusCounts = {
+      draft: 0,
+      needs_revision: 0,
+      rejected: 0,
+      published: 0,
+    };
+
+    statusRows.forEach(row => {
+      if (statusCounts[row.status] !== undefined) {
+        statusCounts[row.status]++;
+      }
+    });
+
+    // 2. Get total reviews count
+    const { count: totalReviews, error: reviewsErr } = await supabase
+      .from('remedy_reviews')
+      .select('*', { count: 'exact', head: true });
+
+    if (reviewsErr) throw reviewsErr;
+
+    // 3. Get tag cloud / symptoms counts
+    const { data: tagRows, error: tagErr } = await supabase
+      .from('remedies')
+      .select('symptom_tags')
+      .eq('is_deleted', false);
+
+    if (tagErr) throw tagErr;
+
+    const tagCounts = {};
+    (tagRows || []).forEach(row => {
+      if (Array.isArray(row.symptom_tags)) {
+        row.symptom_tags.forEach(tag => {
+          if (tag) {
+            tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+          }
+        });
+      }
+    });
+
+    // Sort tag counts and take top 5
+    const topTags = Object.entries(tagCounts)
+      .map(([tag, count]) => ({ tag, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5);
+
+    // 4. Get active contributors (remedies created per author)
+    const { data: authorRows, error: authorErr } = await supabase
+      .from('remedies')
+      .select('author_id, profiles(full_name, email)')
+      .eq('is_deleted', false);
+
+    if (authorErr) throw authorErr;
+
+    const contributorCounts = {};
+    (authorRows || []).forEach(row => {
+      if (row.author_id) {
+        const name = row.profiles?.full_name || row.profiles?.email || 'Anonymous';
+        contributorCounts[row.author_id] = contributorCounts[row.author_id] || { name, count: 0 };
+        contributorCounts[row.author_id].count++;
+      }
+    });
+
+    const topContributors = Object.values(contributorCounts)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5);
+
+    res.json({
+      success: true,
+      stats: {
+        totalRemedies,
+        statusCounts,
+        totalReviews: totalReviews || 0,
+        topTags,
+        topContributors
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // GET single remedy
 router.get('/:id', async (req, res) => {
   try {
